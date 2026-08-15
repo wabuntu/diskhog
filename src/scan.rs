@@ -1,7 +1,10 @@
+use ignore::{WalkBuilder, WalkState};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 pub struct FileEntry {
     pub path: PathBuf,
@@ -34,22 +37,31 @@ pub struct ScanResult {
     pub scan_errors: u64,
 }
 
-/// Walk `root`, staying on its own filesystem (never descending into other
-/// mounts: /proc, /sys, other disks, network shares, ...), and keep the
-/// `top_n` largest regular files seen. Symlinks are skipped entirely so they
-/// can't be followed off the filesystem or double-count another file's size.
-///
-/// Directories walkdir can't read (permission denied, etc.) are counted as
-/// scan errors and skipped rather than aborting the whole scan.
-pub fn scan_top_files(root: &Path, top_n: usize) -> ScanResult {
-    // A max-heap capped at `top_n` would need to scan the *smallest* entry
-    // to evict it; wrapping in Reverse turns BinaryHeap's max-heap into a
-    // min-heap instead, so the smallest of the current top-N is always at
-    // the top and can be evicted in O(log n) when a bigger file shows up.
-    let mut heap: BinaryHeap<Reverse<BySize>> = BinaryHeap::with_capacity(top_n + 1);
-    let mut files_scanned: u64 = 0;
-    let mut scan_errors: u64 = 0;
+/// Start a scan on a background thread and return a handle to join for the
+/// final result, plus a live counter of files scanned so far that the
+/// caller can poll from another thread (e.g. to print progress) without
+/// blocking on the scan itself.
+pub fn scan_top_files_async(root: &Path, top_n: usize) -> (JoinHandle<ScanResult>, Arc<AtomicU64>) {
+    let progress = Arc::new(AtomicU64::new(0));
+    let progress_for_scan = Arc::clone(&progress);
+    let root = root.to_path_buf();
+    let handle = std::thread::spawn(move || scan_top_files(&root, top_n, &progress_for_scan));
+    (handle, progress)
+}
 
+/// Walk `root` in parallel across all available cores, staying on its own
+/// filesystem (never descending into other mounts: /proc, /sys, other
+/// disks, network shares, ...), and keep the `top_n` largest regular files
+/// seen. Symlinks are skipped entirely so they can't be followed off the
+/// filesystem or double-count another file's size. Hidden files and
+/// .gitignore rules are intentionally NOT respected here (unlike this
+/// walker's usual ripgrep-style default) since a huge file being
+/// gitignored doesn't make it any less real on disk.
+///
+/// Entries that can't be read (permission denied, etc.) are counted as scan
+/// errors and skipped rather than aborting the whole scan. `progress` is
+/// incremented as files are found, for a caller on another thread to poll.
+fn scan_top_files(root: &Path, top_n: usize, progress: &AtomicU64) -> ScanResult {
     if top_n == 0 {
         return ScanResult {
             top_files: Vec::new(),
@@ -58,54 +70,79 @@ pub fn scan_top_files(root: &Path, top_n: usize) -> ScanResult {
         };
     }
 
-    let walker = WalkDir::new(root).same_file_system(true).into_iter();
+    let heap: Mutex<BinaryHeap<Reverse<BySize>>> = Mutex::new(BinaryHeap::with_capacity(top_n + 1));
+    let scan_errors = AtomicU64::new(0);
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
 
-    for entry in walker {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => {
-                scan_errors += 1;
-                continue;
-            }
-        };
+    WalkBuilder::new(root)
+        .standard_filters(false)
+        .hidden(false)
+        .same_file_system(true)
+        .threads(threads)
+        .build_parallel()
+        .run(|| {
+            Box::new(|entry| {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => {
+                        scan_errors.fetch_add(1, Ordering::Relaxed);
+                        return WalkState::Continue;
+                    }
+                };
 
-        if entry.file_type().is_symlink() || !entry.file_type().is_file() {
-            continue;
-        }
+                // file_type() is only None for the special "read from stdin"
+                // entry, which we never produce since we always walk a real path.
+                let Some(file_type) = entry.file_type() else {
+                    return WalkState::Continue;
+                };
+                if file_type.is_symlink() || !file_type.is_file() {
+                    return WalkState::Continue;
+                }
 
-        let size = match entry.metadata() {
-            Ok(m) => m.len(),
-            Err(_) => {
-                scan_errors += 1;
-                continue;
-            }
-        };
+                let size = match entry.metadata() {
+                    Ok(m) => m.len(),
+                    Err(_) => {
+                        scan_errors.fetch_add(1, Ordering::Relaxed);
+                        return WalkState::Continue;
+                    }
+                };
 
-        files_scanned += 1;
+                progress.fetch_add(1, Ordering::Relaxed);
 
-        if heap.len() < top_n {
-            heap.push(Reverse(BySize(FileEntry {
-                path: entry.path().to_path_buf(),
-                size,
-            })));
-        } else if let Some(Reverse(smallest)) = heap.peek()
-            && size > smallest.0.size
-        {
-            heap.pop();
-            heap.push(Reverse(BySize(FileEntry {
-                path: entry.path().to_path_buf(),
-                size,
-            })));
-        }
-    }
+                let mut heap = heap.lock().unwrap();
+                if heap.len() < top_n {
+                    heap.push(Reverse(BySize(FileEntry {
+                        path: entry.path().to_path_buf(),
+                        size,
+                    })));
+                } else if let Some(Reverse(smallest)) = heap.peek()
+                    && size > smallest.0.size
+                {
+                    heap.pop();
+                    heap.push(Reverse(BySize(FileEntry {
+                        path: entry.path().to_path_buf(),
+                        size,
+                    })));
+                }
 
-    let mut top_files: Vec<FileEntry> = heap.into_iter().map(|Reverse(BySize(f))| f).collect();
+                WalkState::Continue
+            })
+        });
+
+    let mut top_files: Vec<FileEntry> = heap
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .map(|Reverse(BySize(f))| f)
+        .collect();
     top_files.sort_by_key(|f| Reverse(f.size));
 
     ScanResult {
         top_files,
-        files_scanned,
-        scan_errors,
+        files_scanned: progress.load(Ordering::Relaxed),
+        scan_errors: scan_errors.load(Ordering::Relaxed),
     }
 }
 
@@ -152,6 +189,11 @@ mod tests {
         }
     }
 
+    fn scan(dir: &Path, top_n: usize) -> ScanResult {
+        let (handle, _progress) = scan_top_files_async(dir, top_n);
+        handle.join().unwrap()
+    }
+
     #[test]
     fn human_size_formats_common_ranges() {
         assert_eq!(human_size(0), "0 B");
@@ -168,7 +210,7 @@ mod tests {
         fs::write(dir.path().join("big.bin"), vec![0u8; 1000]).unwrap();
         fs::write(dir.path().join("medium.bin"), vec![0u8; 100]).unwrap();
 
-        let result = scan_top_files(dir.path(), 10);
+        let result = scan(dir.path(), 10);
         assert_eq!(result.files_scanned, 3);
         let sizes: Vec<u64> = result.top_files.iter().map(|f| f.size).collect();
         assert_eq!(sizes, vec![1000, 100, 10]);
@@ -184,7 +226,7 @@ mod tests {
             )
             .unwrap();
         }
-        let result = scan_top_files(dir.path(), 2);
+        let result = scan(dir.path(), 2);
         assert_eq!(result.files_scanned, 5);
         assert_eq!(result.top_files.len(), 2);
         assert_eq!(result.top_files[0].size, 41);
@@ -195,7 +237,7 @@ mod tests {
     fn scan_top_n_zero_returns_nothing_without_walking() {
         let dir = TempDir::new("zero");
         fs::write(dir.path().join("f.bin"), vec![0u8; 10]).unwrap();
-        let result = scan_top_files(dir.path(), 0);
+        let result = scan(dir.path(), 0);
         assert!(result.top_files.is_empty());
         assert_eq!(result.files_scanned, 0);
     }
@@ -206,9 +248,21 @@ mod tests {
         fs::create_dir_all(dir.path().join("a/b")).unwrap();
         fs::write(dir.path().join("a/b/deep.bin"), vec![0u8; 42]).unwrap();
 
-        let result = scan_top_files(dir.path(), 10);
+        let result = scan(dir.path(), 10);
         assert_eq!(result.files_scanned, 1);
         assert_eq!(result.top_files[0].size, 42);
+    }
+
+    #[test]
+    fn scan_includes_hidden_and_gitignored_files() {
+        let dir = TempDir::new("hidden");
+        fs::write(dir.path().join(".hidden.bin"), vec![0u8; 7]).unwrap();
+        fs::write(dir.path().join(".gitignore"), "*.bin\n").unwrap();
+        fs::write(dir.path().join("ignored.bin"), vec![0u8; 9]).unwrap();
+
+        let result = scan(dir.path(), 10);
+        // .gitignore itself + the two .bin files
+        assert_eq!(result.files_scanned, 3);
     }
 
     #[cfg(unix)]
@@ -221,7 +275,7 @@ mod tests {
         fs::write(&target, vec![0u8; 500]).unwrap();
         symlink(&target, dir.path().join("link.bin")).unwrap();
 
-        let result = scan_top_files(dir.path(), 10);
+        let result = scan(dir.path(), 10);
         assert_eq!(result.files_scanned, 1, "the symlink must not be counted");
         assert_eq!(result.top_files.len(), 1);
         assert_eq!(result.top_files[0].path, target);

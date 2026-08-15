@@ -15,6 +15,9 @@ The directory is required — `diskhog` never picks a scan target for you.
 Stays on the filesystem it started on — it won't wander into `/proc`,
 `/sys`, other mounted disks, or network shares. Symlinks are skipped so they
 can't be followed off the filesystem or double-count another file's size.
+The walk itself is parallel across every available core (via the
+[`ignore`](https://docs.rs/ignore) crate — the same walker ripgrep uses),
+with a live "N files scanned so far" counter printed while it runs.
 
 ## Deleting is always a trash move, and always confirmed
 

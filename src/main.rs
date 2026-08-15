@@ -7,8 +7,10 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
-use scan::{FileEntry, human_size, scan_top_files};
+use scan::{FileEntry, human_size, scan_top_files_async};
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 /// List the largest files on disk and send the ones you pick to the trash.
@@ -114,12 +116,20 @@ fn main() {
     let total_space = fs4::total_space(&args.path).unwrap_or(0);
 
     eprintln!("Scanning {} ...", args.path.display());
-    let result = scan_top_files(&args.path, args.top);
+    let (handle, progress) = scan_top_files_async(&args.path, args.top);
+    while !handle.is_finished() {
+        let n = progress.load(Ordering::Relaxed);
+        eprint!("\r  {} files scanned so far...", n);
+        let _ = std::io::stderr().flush();
+        std::thread::sleep(Duration::from_millis(120));
+    }
+    let result = handle.join().expect("scan thread panicked");
+    // Trailing spaces overwrite any leftover digits from the last progress line.
     eprintln!(
-        "Scanned {} files ({} unreadable, skipped). Showing the {} largest.",
+        "\r  Scanned {} files ({} unreadable, skipped). Showing the {} largest.                    ",
         result.files_scanned,
         result.scan_errors,
-        result.top_files.len()
+        result.top_files.len(),
     );
 
     if result.top_files.is_empty() {
