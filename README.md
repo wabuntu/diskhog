@@ -5,10 +5,12 @@ trash — with each file's size and its share of total disk space shown right
 in the list.
 
 ```
-$ diskhog                # scans / by default
-$ diskhog ~/Downloads     # or any directory
-$ diskhog --top 200 /var  # show more than the default 100
+$ diskhog /                # scan the whole filesystem
+$ diskhog ~/Downloads       # or any directory
+$ diskhog --top 200 /var    # show more than the default 30
 ```
+
+The directory is required — `diskhog` never picks a scan target for you.
 
 Stays on the filesystem it started on — it won't wander into `/proc`,
 `/sys`, other mounted disks, or network shares. Symlinks are skipped so they

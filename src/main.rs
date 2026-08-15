@@ -21,11 +21,10 @@ use std::time::Duration;
 struct Args {
     /// Directory to scan. Stays on its filesystem (won't cross into other
     /// mounts, network shares, /proc, /sys, ...).
-    #[arg(default_value = "/")]
     path: PathBuf,
 
     /// How many of the largest files to show
-    #[arg(short, long, default_value_t = 100)]
+    #[arg(short, long, default_value_t = 30)]
     top: usize,
 }
 
