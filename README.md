@@ -4,6 +4,9 @@ TUI that lists the largest files on disk and sends the ones you pick to the
 trash — with each file's size and its share of total disk space shown right
 in the list.
 
+<img src="https://raw.githubusercontent.com/wabuntu/diskhog/main/docs/list.png" alt="diskhog listing the largest files under a directory, ranked by size with each file's share of total disk space" width="480">
+<img src="https://raw.githubusercontent.com/wabuntu/diskhog/main/docs/confirm.png" alt="diskhog's delete confirmation dialog, showing the exact path and size before moving a file to the trash" width="480">
+
 ```
 $ diskhog /                # scan the whole filesystem
 $ diskhog ~/Downloads       # or any directory
