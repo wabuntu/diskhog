@@ -6,6 +6,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+/// Worker threads are capped to this percentage of available cores, so a
+/// scan doesn't try to claim the whole machine.
+const MAX_CPU_PERCENT: usize = 30;
+
+/// Cap the worker pool instead of using every core, so a background scan
+/// doesn't compete too hard with whatever else is running. This bounds how
+/// many stat() calls diskhog can have in flight at once, not a hard
+/// OS-enforced CPU quota, but keeping the pool small is the practical lever
+/// a plain CLI tool has over its own load. Never returns 0, even on a
+/// single-core machine.
+fn capped_threads(available: usize) -> usize {
+    ((available * MAX_CPU_PERCENT) / 100).max(1)
+}
+
 pub struct FileEntry {
     pub path: PathBuf,
     pub size: u64,
@@ -72,9 +86,10 @@ fn scan_top_files(root: &Path, top_n: usize, progress: &AtomicU64) -> ScanResult
 
     let heap: Mutex<BinaryHeap<Reverse<BySize>>> = Mutex::new(BinaryHeap::with_capacity(top_n + 1));
     let scan_errors = AtomicU64::new(0);
-    let threads = std::thread::available_parallelism()
+    let available = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
+    let threads = capped_threads(available);
 
     WalkBuilder::new(root)
         .standard_filters(false)
@@ -192,6 +207,27 @@ mod tests {
     fn scan(dir: &Path, top_n: usize) -> ScanResult {
         let (handle, _progress) = scan_top_files_async(dir, top_n);
         handle.join().unwrap()
+    }
+
+    #[test]
+    fn capped_threads_stays_near_30_percent_and_never_zero() {
+        assert_eq!(capped_threads(16), 4);
+        assert_eq!(capped_threads(8), 2);
+        assert_eq!(
+            capped_threads(4),
+            1,
+            "30% of 4 rounds down, but must not be 0"
+        );
+        assert_eq!(
+            capped_threads(1),
+            1,
+            "a single-core machine still gets one thread"
+        );
+        assert_eq!(
+            capped_threads(0),
+            1,
+            "a bogus 0 reading still gets one thread"
+        );
     }
 
     #[test]
