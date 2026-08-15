@@ -80,7 +80,11 @@ impl App {
         self.confirm_delete = None;
     }
 
-    fn confirm_delete_now(&mut self) {
+    /// `permanent: false` moves the file to the trash (recoverable, but does
+    /// NOT free disk space - it's a same-filesystem rename, the data blocks
+    /// stay allocated). `permanent: true` actually unlinks it, immediately
+    /// freeing the space, with no way back.
+    fn confirm_delete_now(&mut self, permanent: bool) {
         let Some(i) = self.confirm_delete.take() else {
             return;
         };
@@ -88,9 +92,20 @@ impl App {
             return;
         };
 
-        match trash::delete(&file.path) {
+        let result = if permanent {
+            std::fs::remove_file(&file.path).map_err(|e| e.to_string())
+        } else {
+            trash::delete(&file.path).map_err(|e| e.to_string())
+        };
+
+        match result {
             Ok(()) => {
-                self.status = Some(format!("Moved to trash: {}", file.path.display()));
+                let verb = if permanent {
+                    "Deleted"
+                } else {
+                    "Moved to trash"
+                };
+                self.status = Some(format!("{}: {}", verb, file.path.display()));
                 self.files.remove(i);
                 if self.files.is_empty() {
                     self.list_state.select(None);
@@ -99,7 +114,8 @@ impl App {
                 }
             }
             Err(e) => {
-                self.status = Some(format!("Failed to trash {}: {}", file.path.display(), e));
+                let verb = if permanent { "delete" } else { "trash" };
+                self.status = Some(format!("Failed to {} {}: {}", verb, file.path.display(), e));
             }
         }
     }
@@ -162,7 +178,8 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Resul
 
             if app.confirm_delete.is_some() {
                 match key.code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_delete_now(),
+                    KeyCode::Char('t') | KeyCode::Char('T') => app.confirm_delete_now(false),
+                    KeyCode::Char('p') | KeyCode::Char('P') => app.confirm_delete_now(true),
                     _ => app.cancel_delete(),
                 }
                 continue;
@@ -188,7 +205,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
     .split(frame.area());
 
     let header = format!(
-        "diskhog — {} files, disk {}   ↑/↓: select, Enter/d: delete (trash), q: quit",
+        "diskhog — {} files, disk {}   ↑/↓: select, Enter/d: delete, q: quit",
         app.files.len(),
         human_size(app.total_space)
     );
@@ -229,11 +246,11 @@ fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_confirm_popup(frame: &mut Frame, file: &FileEntry) {
-    let area = centered_rect(70, 9, frame.area());
+    let area = centered_rect(70, 11, frame.area());
     frame.render_widget(Clear, area);
 
     let text = format!(
-        "Move to trash?\n\n{}\n({})\n\ny: yes    any other key: cancel",
+        "{}\n({})\n\nt: move to trash (recoverable, space NOT freed)\np: permanently delete (frees space, no undo)\nany other key: cancel",
         file.path.display(),
         human_size(file.size)
     );
@@ -335,7 +352,7 @@ mod tests {
         app.request_delete();
         assert_eq!(app.confirm_delete, Some(0));
 
-        app.confirm_delete_now();
+        app.confirm_delete_now(false);
 
         assert_eq!(app.confirm_delete, None);
         assert!(
@@ -360,6 +377,30 @@ mod tests {
     }
 
     #[test]
+    fn confirm_delete_permanent_actually_frees_the_file_with_no_trash_entry() {
+        let dir =
+            std::env::temp_dir().join(format!("diskhog-app-test-permanent-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("delete_me_for_real.bin");
+        fs::write(&target, vec![0u8; 123]).unwrap();
+
+        let mut app = App::new(vec![entry(target.to_str().unwrap(), 123)], 1000);
+        app.request_delete();
+        app.confirm_delete_now(true);
+
+        assert!(app.files.is_empty());
+        assert!(!target.exists(), "the file should be gone entirely");
+        assert!(
+            app.status.as_deref().unwrap_or("").contains("Deleted"),
+            "status should confirm a real delete, not a trash move: {:?}",
+            app.status
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn confirm_delete_keeps_selection_in_bounds_after_removing_the_last_file() {
         let dir =
             std::env::temp_dir().join(format!("diskhog-app-test-bounds-{}", std::process::id()));
@@ -379,7 +420,7 @@ mod tests {
         );
         app.list_state.select(Some(1)); // the last file
         app.request_delete();
-        app.confirm_delete_now();
+        app.confirm_delete_now(false);
 
         assert_eq!(app.files.len(), 1);
         assert_eq!(

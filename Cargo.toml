@@ -1,6 +1,6 @@
 [package]
 name = "diskhog"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["wabuntu <to.wabuntu@proton.me>"]
 edition = "2024"
 license = "MIT OR Apache-2.0"
@@ -8,8 +8,9 @@ homepage = "https://github.com/wabuntu"
 repository = "https://github.com/wabuntu/diskhog"
 documentation = "https://docs.rs/diskhog"
 description = """
-TUI that lists the largest files on disk and moves the ones you pick
-to the trash, with size and %-of-disk shown for each.
+TUI that lists the largest files on disk and lets you delete the ones
+you pick, to the trash or for real, with size and %-of-disk shown for
+each.
 """
 
 [dependencies]
