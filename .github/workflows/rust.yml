@@ -13,6 +13,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  lint-audit:
+    name: Lint and vulnerability audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --all-targets --verbose -- -D warnings
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit dependencies
+        run: cargo audit
+
   build-test:
     name: Build and test (${{ matrix.os }})
     strategy:
@@ -45,7 +58,7 @@ jobs:
   push-binaries:
     name: Push binaries
     runs-on: ubuntu-latest
-    needs: build-test
+    needs: [build-test, lint-audit]
     steps:
       - uses: actions/checkout@v3
       - uses: swatinem/rust-cache@v2
