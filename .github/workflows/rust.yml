@@ -156,8 +156,6 @@ jobs:
     needs: release-please
     if: needs.release-please.outputs.created
 
-    environment: crates.io
-
     steps:
       - uses: actions/checkout@v3
       - uses: swatinem/rust-cache@v2
