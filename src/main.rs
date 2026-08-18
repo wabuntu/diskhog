@@ -7,7 +7,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
-use scan::{FileEntry, human_size, scan_top_files_async};
+use scan::{DEFAULT_MAX_CPU_PERCENT, FileEntry, human_size, scan_top_files_async};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -28,6 +28,11 @@ struct Args {
     /// How many of the largest files to show
     #[arg(short, long, default_value_t = 30)]
     top: usize,
+
+    /// Cap the scan's worker threads to this percentage of available cores
+    /// (1-100), so it doesn't compete too hard with whatever else is running.
+    #[arg(long, default_value_t = DEFAULT_MAX_CPU_PERCENT as u8, value_parser = clap::value_parser!(u8).range(1..=100))]
+    max_cpu: u8,
 }
 
 struct App {
@@ -132,7 +137,7 @@ fn main() {
     let total_space = fs4::total_space(&args.path).unwrap_or(0);
 
     eprintln!("Scanning {} ...", args.path.display());
-    let (handle, progress) = scan_top_files_async(&args.path, args.top);
+    let (handle, progress) = scan_top_files_async(&args.path, args.top, args.max_cpu as usize);
     while !handle.is_finished() {
         let n = progress.load(Ordering::Relaxed);
         eprint!("\r  {} files scanned so far...", n);

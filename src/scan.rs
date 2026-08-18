@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-/// Worker threads are capped to this percentage of available cores, so a
-/// scan doesn't try to claim the whole machine.
-const MAX_CPU_PERCENT: usize = 30;
+/// Default worker-thread cap, as a percentage of available cores, when the
+/// caller doesn't ask for a different one.
+pub const DEFAULT_MAX_CPU_PERCENT: usize = 30;
 
 /// Cap the worker pool instead of using every core, so a background scan
 /// doesn't compete too hard with whatever else is running. This bounds how
@@ -16,8 +16,8 @@ const MAX_CPU_PERCENT: usize = 30;
 /// OS-enforced CPU quota, but keeping the pool small is the practical lever
 /// a plain CLI tool has over its own load. Never returns 0, even on a
 /// single-core machine.
-fn capped_threads(available: usize) -> usize {
-    ((available * MAX_CPU_PERCENT) / 100).max(1)
+fn capped_threads(available: usize, max_cpu_percent: usize) -> usize {
+    ((available * max_cpu_percent) / 100).max(1)
 }
 
 pub struct FileEntry {
@@ -55,11 +55,17 @@ pub struct ScanResult {
 /// final result, plus a live counter of files scanned so far that the
 /// caller can poll from another thread (e.g. to print progress) without
 /// blocking on the scan itself.
-pub fn scan_top_files_async(root: &Path, top_n: usize) -> (JoinHandle<ScanResult>, Arc<AtomicU64>) {
+pub fn scan_top_files_async(
+    root: &Path,
+    top_n: usize,
+    max_cpu_percent: usize,
+) -> (JoinHandle<ScanResult>, Arc<AtomicU64>) {
     let progress = Arc::new(AtomicU64::new(0));
     let progress_for_scan = Arc::clone(&progress);
     let root = root.to_path_buf();
-    let handle = std::thread::spawn(move || scan_top_files(&root, top_n, &progress_for_scan));
+    let handle = std::thread::spawn(move || {
+        scan_top_files(&root, top_n, max_cpu_percent, &progress_for_scan)
+    });
     (handle, progress)
 }
 
@@ -75,7 +81,12 @@ pub fn scan_top_files_async(root: &Path, top_n: usize) -> (JoinHandle<ScanResult
 /// Entries that can't be read (permission denied, etc.) are counted as scan
 /// errors and skipped rather than aborting the whole scan. `progress` is
 /// incremented as files are found, for a caller on another thread to poll.
-fn scan_top_files(root: &Path, top_n: usize, progress: &AtomicU64) -> ScanResult {
+fn scan_top_files(
+    root: &Path,
+    top_n: usize,
+    max_cpu_percent: usize,
+    progress: &AtomicU64,
+) -> ScanResult {
     if top_n == 0 {
         return ScanResult {
             top_files: Vec::new(),
@@ -89,7 +100,7 @@ fn scan_top_files(root: &Path, top_n: usize, progress: &AtomicU64) -> ScanResult
     let available = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let threads = capped_threads(available);
+    let threads = capped_threads(available, max_cpu_percent);
 
     WalkBuilder::new(root)
         .standard_filters(false)
@@ -205,28 +216,34 @@ mod tests {
     }
 
     fn scan(dir: &Path, top_n: usize) -> ScanResult {
-        let (handle, _progress) = scan_top_files_async(dir, top_n);
+        let (handle, _progress) = scan_top_files_async(dir, top_n, DEFAULT_MAX_CPU_PERCENT);
         handle.join().unwrap()
     }
 
     #[test]
-    fn capped_threads_stays_near_30_percent_and_never_zero() {
-        assert_eq!(capped_threads(16), 4);
-        assert_eq!(capped_threads(8), 2);
+    fn capped_threads_stays_near_requested_percent_and_never_zero() {
+        assert_eq!(capped_threads(16, 30), 4);
+        assert_eq!(capped_threads(8, 30), 2);
         assert_eq!(
-            capped_threads(4),
+            capped_threads(4, 30),
             1,
             "30% of 4 rounds down, but must not be 0"
         );
         assert_eq!(
-            capped_threads(1),
+            capped_threads(1, 30),
             1,
             "a single-core machine still gets one thread"
         );
         assert_eq!(
-            capped_threads(0),
+            capped_threads(0, 30),
             1,
             "a bogus 0 reading still gets one thread"
+        );
+        assert_eq!(capped_threads(16, 100), 16, "100% uses every core");
+        assert_eq!(
+            capped_threads(16, 1),
+            1,
+            "a tiny percent still rounds up to 1"
         );
     }
 

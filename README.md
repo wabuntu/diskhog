@@ -8,9 +8,10 @@ share of total disk space shown right in the list.
 <img src="https://raw.githubusercontent.com/wabuntu/diskhog/main/docs/confirm.png" alt="diskhog's delete confirmation dialog, showing the exact path and size before moving a file to the trash" width="480">
 
 ```
-$ diskhog /                # scan the whole filesystem
-$ diskhog ~/Downloads       # or any directory
-$ diskhog --top 200 /var    # show more than the default 30
+$ diskhog /                       # scan the whole filesystem
+$ diskhog ~/Downloads              # or any directory
+$ diskhog --top 200 /var           # show more than the default 30
+$ diskhog --max-cpu 60 /var        # allow a bigger/smaller worker pool than the default 30%
 ```
 
 The directory is required — `diskhog` never picks a scan target for you.
@@ -19,9 +20,10 @@ Stays on the filesystem it started on — it won't wander into `/proc`,
 `/sys`, other mounted disks, or network shares. Symlinks are skipped so they
 can't be followed off the filesystem or double-count another file's size.
 The walk itself is parallel (via the [`ignore`](https://docs.rs/ignore)
-crate — the same walker ripgrep uses), capped to ~30% of available cores so
-a scan doesn't try to claim the whole machine, with a live "N files scanned
-so far" counter printed while it runs.
+crate — the same walker ripgrep uses), capped by default to ~30% of
+available cores so a scan doesn't try to claim the whole machine —
+adjustable with `--max-cpu <1-100>` — with a live "N files scanned so far"
+counter printed while it runs.
 
 ## Deleting always asks, and always asks which way
 
@@ -55,3 +57,9 @@ Keys:
 - `p`: permanently delete it (frees space, no undo)
 - any other key: cancel the pending delete
 - `q` / `Esc`: quit
+
+Flags:
+
+- `--top <N>`: how many of the largest files to show (default 30)
+- `--max-cpu <1-100>`: cap the scan's worker threads to this percentage of
+  available cores (default 30)
