@@ -12,6 +12,8 @@ TUI that lists the largest files on disk and lets you delete the ones
 you pick, to the trash or for real, with size and %-of-disk shown for
 each.
 """
+categories = ["command-line-utilities", "filesystem"]
+keywords = ["disk-usage", "tui", "cleanup", "trash", "cli"]
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
