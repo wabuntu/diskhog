@@ -1,7 +1,6 @@
 # diskhog
 
 [![Crates.io](https://img.shields.io/crates/v/diskhog.svg)](https://crates.io/crates/diskhog)
-[![docs.rs](https://img.shields.io/docsrs/diskhog)](https://docs.rs/diskhog)
 [![CI](https://github.com/wabuntu/diskhog/actions/workflows/rust.yml/badge.svg)](https://github.com/wabuntu/diskhog/actions/workflows/rust.yml)
 
 TUI that lists the largest files on disk and lets you delete the ones you
