@@ -11,10 +11,11 @@ share of total disk space shown right in the list.
 <img src="https://raw.githubusercontent.com/wabuntu/diskhog/main/docs/confirm.png" alt="diskhog's delete confirmation dialog, showing the exact path and size before moving a file to the trash" width="480">
 
 ```
-$ diskhog /                       # scan the whole filesystem
-$ diskhog ~/Downloads              # or any directory
-$ diskhog --top 200 /var           # show more than the default 30
-$ diskhog --max-cpu 60 /var        # allow a bigger/smaller worker pool than the default 30%
+$ diskhog /                              # scan the whole filesystem
+$ diskhog ~/Downloads                    # or any directory
+$ diskhog --top 200 /var                 # show more than the default 30
+$ diskhog --max-cpu 60 /var              # allow a bigger/smaller worker pool than the default 30%
+$ diskhog --exclude node_modules ~/code  # skip anything matching a glob (repeatable)
 ```
 
 The directory is required — `diskhog` never picks a scan target for you.
@@ -27,6 +28,17 @@ crate — the same walker ripgrep uses), capped by default to ~30% of
 available cores so a scan doesn't try to claim the whole machine —
 adjustable with `--max-cpu <1-100>` — with a live "N files scanned so far"
 counter printed while it runs.
+
+`--exclude <PATTERN>` (repeatable, e.g. `--exclude node_modules --exclude
+'*.log'`) skips anything matching the glob — a plain name like
+`node_modules` matches that directory anywhere under the scan root, same
+as a `.gitignore` entry would. Handy for the things you already know are
+big and already know you don't want to touch (build output, `.git`,
+package caches).
+
+Each row also shows how long ago the file was last modified — `3h`,
+`12d`, `2mo`, `1y` — so you're not guessing whether something huge is
+live data or forgotten cruft before you decide to delete it.
 
 ## Performance
 
@@ -86,7 +98,8 @@ consistently loses no matter the cache state.
 ## Deleting always asks, and always asks which way
 
 Selecting a file and pressing Enter/`d` shows a confirmation dialog with
-the exact path and size, and two ways to actually remove it:
+the exact path, size, and how long ago it was last modified, and two
+ways to actually remove it:
 
 - `t` — move to the trash (via the [`trash`](https://docs.rs/trash) crate,
   following the freedesktop.org trash spec on Linux), recoverable like
@@ -121,3 +134,5 @@ Flags:
 - `--top <N>`: how many of the largest files to show (default 30)
 - `--max-cpu <1-100>`: cap the scan's worker threads to this percentage of
   available cores (default 30)
+- `--exclude <PATTERN>` / `-x <PATTERN>`: skip paths matching this glob
+  (repeatable — pass it more than once to exclude several patterns)

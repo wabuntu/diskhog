@@ -7,7 +7,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
-use scan::{DEFAULT_MAX_CPU_PERCENT, FileEntry, human_size, scan_top_files_async};
+use scan::{DEFAULT_MAX_CPU_PERCENT, FileEntry, human_age, human_size, scan_top_files_async};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -33,6 +33,11 @@ struct Args {
     /// (1-100), so it doesn't compete too hard with whatever else is running.
     #[arg(long, default_value_t = DEFAULT_MAX_CPU_PERCENT as u8, value_parser = clap::value_parser!(u8).range(1..=100))]
     max_cpu: u8,
+
+    /// Skip paths matching this glob (e.g. "node_modules" or "*.log").
+    /// Repeatable.
+    #[arg(short = 'x', long = "exclude", value_name = "PATTERN")]
+    exclude: Vec<String>,
 }
 
 struct App {
@@ -137,7 +142,14 @@ fn main() {
     let total_space = fs4::total_space(&args.path).unwrap_or(0);
 
     eprintln!("Scanning {} ...", args.path.display());
-    let (handle, progress) = scan_top_files_async(&args.path, args.top, args.max_cpu as usize);
+    let (handle, progress) =
+        match scan_top_files_async(&args.path, args.top, args.max_cpu as usize, &args.exclude) {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        };
     while !handle.is_finished() {
         let n = progress.load(Ordering::Relaxed);
         eprint!("\r  {} files scanned so far...", n);
@@ -226,9 +238,10 @@ fn draw(frame: &mut Frame, app: &mut App) {
                 0.0
             };
             ListItem::new(format!(
-                "{:>10}  {:>6.2}%  {}",
+                "{:>10}  {:>6.2}%  {:>8}  {}",
                 human_size(f.size),
                 pct,
+                human_age(f.mtime),
                 f.path.display()
             ))
         })
@@ -255,9 +268,10 @@ fn draw_confirm_popup(frame: &mut Frame, file: &FileEntry) {
     frame.render_widget(Clear, area);
 
     let text = format!(
-        "{}\n({})\n\nt: move to trash (recoverable, space NOT freed)\np: permanently delete (frees space, no undo)\nany other key: cancel",
+        "{}\n({}, last modified {})\n\nt: move to trash (recoverable, space NOT freed)\np: permanently delete (frees space, no undo)\nany other key: cancel",
         file.path.display(),
-        human_size(file.size)
+        human_size(file.size),
+        human_age(file.mtime),
     );
     let popup = Paragraph::new(text)
         .wrap(ratatui::widgets::Wrap { trim: false })
@@ -291,6 +305,7 @@ mod tests {
         FileEntry {
             path: PathBuf::from(name),
             size,
+            mtime: std::time::SystemTime::now(),
         }
     }
 

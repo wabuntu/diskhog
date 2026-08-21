@@ -1,3 +1,4 @@
+use ignore::overrides::{Override, OverrideBuilder};
 use ignore::{WalkBuilder, WalkState};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -5,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::SystemTime;
 
 /// Default worker-thread cap, as a percentage of available cores, when the
 /// caller doesn't ask for a different one.
@@ -23,6 +25,7 @@ fn capped_threads(available: usize, max_cpu_percent: usize) -> usize {
 pub struct FileEntry {
     pub path: PathBuf,
     pub size: u64,
+    pub mtime: SystemTime,
 }
 
 /// Wraps a FileEntry so it can live in a BinaryHeap ordered purely by size.
@@ -51,22 +54,39 @@ pub struct ScanResult {
     pub scan_errors: u64,
 }
 
+/// Builds the exclude list `WalkBuilder` understands from plain glob
+/// strings like `node_modules` or `*.log` — each is treated as an
+/// exclude (never an include-only whitelist), matching what `--exclude`
+/// users expect regardless of whether they think to type a leading `!`.
+fn build_excludes(root: &Path, patterns: &[String]) -> Result<Override, String> {
+    let mut builder = OverrideBuilder::new(root);
+    for pattern in patterns {
+        builder
+            .add(&format!("!{pattern}"))
+            .map_err(|e| format!("invalid --exclude pattern '{pattern}': {e}"))?;
+    }
+    builder.build().map_err(|e| e.to_string())
+}
+
 /// Start a scan on a background thread and return a handle to join for the
 /// final result, plus a live counter of files scanned so far that the
 /// caller can poll from another thread (e.g. to print progress) without
-/// blocking on the scan itself.
+/// blocking on the scan itself. Fails fast (before spawning anything) if
+/// one of `excludes` isn't a valid glob.
 pub fn scan_top_files_async(
     root: &Path,
     top_n: usize,
     max_cpu_percent: usize,
-) -> (JoinHandle<ScanResult>, Arc<AtomicU64>) {
+    excludes: &[String],
+) -> Result<(JoinHandle<ScanResult>, Arc<AtomicU64>), String> {
+    let overrides = build_excludes(root, excludes)?;
     let progress = Arc::new(AtomicU64::new(0));
     let progress_for_scan = Arc::clone(&progress);
     let root = root.to_path_buf();
     let handle = std::thread::spawn(move || {
-        scan_top_files(&root, top_n, max_cpu_percent, &progress_for_scan)
+        scan_top_files(&root, top_n, max_cpu_percent, overrides, &progress_for_scan)
     });
-    (handle, progress)
+    Ok((handle, progress))
 }
 
 /// Walk `root` in parallel across all available cores, staying on its own
@@ -85,6 +105,7 @@ fn scan_top_files(
     root: &Path,
     top_n: usize,
     max_cpu_percent: usize,
+    overrides: Override,
     progress: &AtomicU64,
 ) -> ScanResult {
     if top_n == 0 {
@@ -106,6 +127,7 @@ fn scan_top_files(
         .standard_filters(false)
         .hidden(false)
         .same_file_system(true)
+        .overrides(overrides)
         .threads(threads)
         .build_parallel()
         .run(|| {
@@ -127,8 +149,8 @@ fn scan_top_files(
                     return WalkState::Continue;
                 }
 
-                let size = match entry.metadata() {
-                    Ok(m) => m.len(),
+                let (size, mtime) = match entry.metadata() {
+                    Ok(m) => (m.len(), m.modified().unwrap_or_else(|_| SystemTime::now())),
                     Err(_) => {
                         scan_errors.fetch_add(1, Ordering::Relaxed);
                         return WalkState::Continue;
@@ -142,6 +164,7 @@ fn scan_top_files(
                     heap.push(Reverse(BySize(FileEntry {
                         path: entry.path().to_path_buf(),
                         size,
+                        mtime,
                     })));
                 } else if let Some(Reverse(smallest)) = heap.peek()
                     && size > smallest.0.size
@@ -150,6 +173,7 @@ fn scan_top_files(
                     heap.push(Reverse(BySize(FileEntry {
                         path: entry.path().to_path_buf(),
                         size,
+                        mtime,
                     })));
                 }
 
@@ -189,10 +213,34 @@ pub fn human_size(bytes: u64) -> String {
     }
 }
 
+/// "3d"/"2mo"/"1y"-style relative age, compact enough to sit in a list
+/// column next to the size. A clock-skewed mtime in the future (or one
+/// exactly now) reads as "just now" rather than underflowing.
+pub fn human_age(mtime: SystemTime) -> String {
+    let secs = SystemTime::now()
+        .duration_since(mtime)
+        .unwrap_or_default()
+        .as_secs();
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 60 * 60 {
+        format!("{}m", secs / 60)
+    } else if secs < 60 * 60 * 24 {
+        format!("{}h", secs / (60 * 60))
+    } else if secs < 60 * 60 * 24 * 30 {
+        format!("{}d", secs / (60 * 60 * 24))
+    } else if secs < 60 * 60 * 24 * 365 {
+        format!("{}mo", secs / (60 * 60 * 24 * 30))
+    } else {
+        format!("{}y", secs / (60 * 60 * 24 * 365))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::time::Duration;
 
     /// A directory under the OS temp dir that removes itself on drop, so
     /// scan tests don't leak files into /tmp on failure.
@@ -216,7 +264,13 @@ mod tests {
     }
 
     fn scan(dir: &Path, top_n: usize) -> ScanResult {
-        let (handle, _progress) = scan_top_files_async(dir, top_n, DEFAULT_MAX_CPU_PERCENT);
+        scan_with_excludes(dir, top_n, &[])
+    }
+
+    fn scan_with_excludes(dir: &Path, top_n: usize, excludes: &[&str]) -> ScanResult {
+        let excludes: Vec<String> = excludes.iter().map(|s| s.to_string()).collect();
+        let (handle, _progress) =
+            scan_top_files_async(dir, top_n, DEFAULT_MAX_CPU_PERCENT, &excludes).unwrap();
         handle.join().unwrap()
     }
 
@@ -332,5 +386,73 @@ mod tests {
         assert_eq!(result.files_scanned, 1, "the symlink must not be counted");
         assert_eq!(result.top_files.len(), 1);
         assert_eq!(result.top_files[0].path, target);
+    }
+
+    #[test]
+    fn scan_skips_paths_matching_an_exclude_pattern() {
+        let dir = TempDir::new("exclude");
+        fs::create_dir_all(dir.path().join("node_modules")).unwrap();
+        fs::write(dir.path().join("node_modules/big.bin"), vec![0u8; 1000]).unwrap();
+        fs::write(dir.path().join("keep.bin"), vec![0u8; 10]).unwrap();
+
+        let result = scan_with_excludes(dir.path(), 10, &["node_modules"]);
+        assert_eq!(result.files_scanned, 1, "only keep.bin should be walked");
+        assert_eq!(result.top_files[0].path, dir.path().join("keep.bin"));
+    }
+
+    #[test]
+    fn scan_skips_paths_matching_a_glob_exclude_pattern() {
+        let dir = TempDir::new("exclude-glob");
+        fs::write(dir.path().join("app.log"), vec![0u8; 1000]).unwrap();
+        fs::write(dir.path().join("keep.bin"), vec![0u8; 10]).unwrap();
+
+        let result = scan_with_excludes(dir.path(), 10, &["*.log"]);
+        assert_eq!(result.files_scanned, 1);
+        assert_eq!(result.top_files[0].path, dir.path().join("keep.bin"));
+    }
+
+    #[test]
+    fn scan_rejects_an_invalid_exclude_pattern_before_spawning_anything() {
+        let dir = TempDir::new("bad-pattern");
+        let err = scan_top_files_async(dir.path(), 10, DEFAULT_MAX_CPU_PERCENT, &["[".to_string()])
+            .unwrap_err();
+        assert!(err.contains("invalid --exclude pattern"));
+    }
+
+    #[test]
+    fn human_age_formats_common_ranges() {
+        let now = SystemTime::now();
+        assert_eq!(human_age(now), "just now");
+        assert_eq!(
+            human_age(now - Duration::from_secs(60 * 5)),
+            "5m",
+            "5 minutes ago"
+        );
+        assert_eq!(
+            human_age(now - Duration::from_secs(60 * 60 * 3)),
+            "3h",
+            "3 hours ago"
+        );
+        assert_eq!(
+            human_age(now - Duration::from_secs(60 * 60 * 24 * 4)),
+            "4d",
+            "4 days ago"
+        );
+        assert_eq!(
+            human_age(now - Duration::from_secs(60 * 60 * 24 * 60)),
+            "2mo",
+            "2 months ago"
+        );
+        assert_eq!(
+            human_age(now - Duration::from_secs(60 * 60 * 24 * 400)),
+            "1y",
+            "just over a year ago"
+        );
+    }
+
+    #[test]
+    fn human_age_treats_a_future_mtime_as_just_now() {
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        assert_eq!(human_age(future), "just now");
     }
 }
